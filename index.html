@@ -1,0 +1,156 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Compendio Normativo TDF</title>
+<body>
+  <!-- Botón para ubicar dentro del Administrador, junto a "Eliminar seleccionados" -->
+  <span id="ghSyncInlineContainer" style="display:none;margin-left:8px;">
+    <button id="ghSyncInlineBtn" title="Sincronizar con GitHub"
+      style="padding:6px 10px;border-radius:8px;border:0;font-weight:600;background:#121212;color:#fff;cursor:pointer;">
+      GitHub Sync
+    </button>
+  </span>
+
+  <!-- === GitHub Autosave (Admin-only, SAFE) === -->
+  <style>
+    #ghSyncPanel{position:fixed;right:14px;bottom:64px;width:340px;background:#fff;color:#111;border-radius:12px;box-shadow:0 12px 32px rgba(0,0,0,.2);padding:12px;z-index:9999;display:none}
+    #ghSyncPanel label{font-size:12px;color:#555;display:block;margin-top:8px}
+    #ghSyncPanel input[type=text],#ghSyncPanel input[type=password]{width:100%;border:1px solid #ddd;border-radius:8px;padding:8px}
+    #ghSyncPanel .row{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+    #ghSyncStatus{font-size:12px;margin-top:8px}
+    #ghSaveNow{padding:8px 10px;border-radius:8px;border:0;font-weight:600;cursor:pointer;background:#0b6bcb;color:#fff}
+    #ghClose{padding:8px 10px;border-radius:8px;border:0;font-weight:600;cursor:pointer;background:#eee}
+  </style>
+
+  <div id="ghSyncPanel">
+    <div style="font-weight:800;font-size:14px;margin-bottom:6px">Sincronización con GitHub</div>
+    <label>Owner (usuario u organización)</label>
+    <input id="ghOwner" type="text" placeholder="p.ej. adratler" />
+    <div class="row">
+      <div><label>Repo</label><input id="ghRepo" type="text" placeholder="Compendio-normativo-TDF"/></div>
+      <div><label>Branch</label><input id="ghBranch" type="text" value="main"/></div>
+    </div>
+    <label>Ruta del JSON en el repo</label>
+    <input id="ghPath" type="text" value="indice-compendio-tdf.json"/>
+    <label>Token (PAT) con permiso Contents: Read & Write</label>
+    <input id="ghToken" type="password" placeholder="se guarda en este navegador"/>
+    <label><input id="ghAutosave" type="checkbox" /> Guardar automáticamente tras el primer guardado manual</label>
+    <div class="actions"><button id="ghSaveNow">Guardar ahora</button><button id="ghClose">Cerrar</button></div>
+    <div id="ghSyncStatus" class="muted"></div>
+  </div>
+
+  <script>
+  (function(){
+    const $=s=>document.querySelector(s);
+    const KEY='ghSyncSettings_v3';
+    let BOOT_AT=Date.now(), AUTOSAVE_READY=false;
+    const MIN_BOOT_DELAY_MS=8000, MIN_ITEMS_TO_COMMIT=1;
+
+    function mountInlineButton(){
+      const admin = document.querySelector('#admin') || document.body;
+      const killBtn = Array.from(admin.querySelectorAll('button, *')).find(el=>/eliminar\s*seleccionados/i.test(el.textContent||''));
+      const holder = $('#ghSyncInlineContainer');
+      if (killBtn && holder){
+        holder.style.display='inline-block';
+        killBtn.insertAdjacentElement('afterend', holder);
+      } else if (admin && holder) {
+        holder.style.display='inline-block';
+        admin.appendChild(holder);
+      }
+    }
+    setTimeout(mountInlineButton, 600);
+
+    // Carga el JSON del repo si la app arrancó sin datos
+    setTimeout(()=>{
+      try{
+        if (window.state && Array.isArray(window.state.items) && window.state.items.length===0) {
+          fetch('indice-compendio-tdf.json',{cache:'no-store'})
+            .then(r=>r.ok?r.json():null)
+            .then(obj=>{
+              if(obj && Array.isArray(obj.items)){
+                window.state.items=obj.items;
+                window.state.catalogs=obj.catalogs||window.state.catalogs||{tipos:[],emisores:[],temas:[]};
+                if(typeof window.renderOperativa==='function')try{window.renderOperativa()}catch(_){}
+                if(typeof window.renderAdminABM==='function')try{window.renderAdminABM()}catch(_){}
+              }
+            }).catch(()=>{});
+        }
+      }catch(e){}
+    },800);
+
+    function b64(s){return btoa(unescape(encodeURIComponent(s)))}
+    function payload(){
+      const items=(window.state&&window.state.items)||[];
+      const catalogs=(window.state&&window.state.catalogs)||{tipos:[],emisores:[],temas:[]};
+      return JSON.stringify({version:1,generated:new Date().toISOString(),items,catalogs},null,2);
+    }
+    function nItems(json){try{const o=JSON.parse(json);return Array.isArray(o.items)?o.items.length:0}catch{return 0}}
+    function load(){try{return JSON.parse(localStorage.getItem(KEY)||'{}')}catch{return{}}}
+    function save(o){localStorage.setItem(KEY,JSON.stringify(o))}
+
+    async function ghGet(o){
+      const url=`https://api.github.com/repos/${o.owner}/${o.repo}/contents/${o.path}?ref=${encodeURIComponent(o.branch)}`;
+      const hdr={'Accept':'application/vnd.github.v3+json'}; if(o.token) hdr.Authorization='token '+o.token;
+      const r=await fetch(url,{headers:hdr}); if(r.status===404) return null; if(!r.ok) throw new Error('GET '+r.status); return r.json();
+    }
+    async function ghPut(o,content,sha,msg){
+      const url=`https://api.github.com/repos/${o.owner}/${o.repo}/contents/${o.path}`;
+      const hdr={'Accept':'application/vnd.github.v3+json'}; if(o.token) hdr.Authorization='token '+o.token;
+      const body={message:msg||'Update indice-compendio-tdf.json',content:b64(content),branch:o.branch}; if(sha) body.sha=sha;
+      const r=await fetch(url,{method:'PUT',headers:hdr,body:JSON.stringify(body)}); if(!r.ok) throw new Error('PUT '+r.status+': '+await r.text()); return r.json();
+    }
+
+    function setStatus(t){const s=$('#ghSyncStatus'); if(s) s.textContent=t;}
+    async function doCommit(manual){
+      const old=load();
+      const o={
+        owner:($('#ghOwner')||{}).value||old.owner||'',
+        repo:($('#ghRepo')||{}).value||old.repo||'',
+        branch:($('#ghBranch')||{}).value||old.branch||'main',
+        path:($('#ghPath')||{}).value||old.path||'indice-compendio-tdf.json',
+        token:($('#ghToken')||{}).value||old.token||'',
+        autosave:($('#ghAutosave')||{}).checked||old.autosave||false
+      };
+      save(o);
+      setStatus('Guardando en GitHub...');
+      if(!o.owner||!o.repo||!o.token){ setStatus('Faltan Owner/Repo/Token.'); return; }
+      const content=payload(); if(nItems(content)<MIN_ITEMS_TO_COMMIT){ setStatus('Bloqueado: evitar subir JSON vacío (0 ítems).'); return; }
+      try{
+        const ex=await ghGet(o), sha=ex&&ex.sha;
+        const res=await ghPut(o,content,sha,(manual?'Manual: ':'Auto: ')+'Actualiza base normativa');
+        setStatus('OK: commit '+(res.commit&&res.commit.sha?res.commit.sha.substring(0,7):'hecho')+'. Pages puede demorar 1–2 min.');
+        if(manual && !AUTOSAVE_READY){ AUTOSAVE_READY=true; ($('#ghAutosave')||{}).checked=true; save({...o,autosave:true}); }
+      }catch(e){ setStatus('Error: '+e.message); }
+    }
+
+    function scheduleCommit(){
+      const sinceBoot=Date.now()-BOOT_AT, o=load();
+      if(!o.autosave) return; if(sinceBoot<MIN_BOOT_DELAY_MS) return; if(!AUTOSAVE_READY) return;
+      const content=payload(); if(nItems(content)<MIN_ITEMS_TO_COMMIT) return;
+      clearTimeout(scheduleCommit._t); scheduleCommit._t=setTimeout(()=>doCommit(false),1200);
+    }
+
+    document.addEventListener('click',(ev)=>{
+      if(ev.target && ev.target.id==='ghSyncInlineBtn'){ const p=$('#ghSyncPanel'); if(p) p.style.display=(p.style.display==='none'||!p.style.display)?'block':'none'; }
+      if(ev.target && ev.target.id==='ghClose'){ const p=$('#ghSyncPanel'); if(p) p.style.display='none'; }
+      if(ev.target && ev.target.id==='ghSaveNow'){ doCommit(true); }
+    });
+
+    // Hook: cada vez que la app guarda (ABM de normas y nomencladores), dispara autosave
+    setTimeout(()=>{
+      try{
+        if(typeof window.saveAll==='function'){
+          const orig=window.saveAll;
+          window.saveAll=function(){
+            const r=orig.apply(this,arguments);
+            try{ scheduleCommit(); }catch(_){}
+            return r;
+          };
+        }
+      }catch(_){}
+    },1000);
+  })();
+  </script>
+  <!-- === /GitHub Autosave (Admin-only, SAFE) === -->
+
+</body>
+</html>
